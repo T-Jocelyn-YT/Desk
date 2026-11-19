@@ -33,6 +33,22 @@ class Position:
 
 
 @dataclass(frozen=True)
+class FillSettlement:
+    """One paper fill resolved against the window's open and close."""
+
+    window_start: int
+    side: str
+    shares: Decimal
+    price: Decimal
+    notional: Decimal
+    fee: Decimal
+    outcome: str
+    open_price: Decimal
+    final_price: Decimal
+    realized_pnl: Decimal
+
+
+@dataclass(frozen=True)
 class Rejection:
     reason: str
 
@@ -146,20 +162,37 @@ class RiskState:
         self.fees_today += approval.fee
         return position
 
-    def settle(self, window_start: int, open_price: Decimal, final_price: Decimal) -> list[Position]:
+    def settle(self, window_start: int, open_price: Decimal, final_price: Decimal) -> list[FillSettlement]:
         """Settle unsettled buys in this window. Up wins when final >= open."""
 
-        up_wins = as_decimal(final_price) >= as_decimal(open_price)
-        settled: list[Position] = []
+        open_price = as_decimal(open_price)
+        final_price = as_decimal(final_price)
+        outcome = "Up" if final_price >= open_price else "Down"
+        up_wins = outcome == "Up"
+        settled: list[FillSettlement] = []
         for position in self.positions:
             if position.window_start != window_start or position.settled:
                 continue
             won = (position.side == "Up" and up_wins) or (position.side == "Down" and not up_wins)
             payout = position.shares if won else Decimal("0")
+            realized_pnl = payout - position.notional - position.fee
             self.cash += payout
-            self.realized += payout - position.notional - position.fee
+            self.realized += realized_pnl
             position.settled = True
-            settled.append(position)
+            settled.append(
+                FillSettlement(
+                    window_start=window_start,
+                    side=position.side,
+                    shares=position.shares,
+                    price=position.price,
+                    notional=position.notional,
+                    fee=position.fee,
+                    outcome=outcome,
+                    open_price=open_price,
+                    final_price=final_price,
+                    realized_pnl=realized_pnl,
+                )
+            )
         if self.realized <= -DAILY_STOP_USD:
             self.halted = True
             self.halt_reason = "daily_stop"

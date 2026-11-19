@@ -154,6 +154,69 @@ def test_missing_price_to_beat_uses_the_boundary_tick_without_blocking(tmp_path)
     assert fill["price"] == "0.40"
 
 
+def _lines(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def test_twap_close_writes_a_settlement_line_with_pnl_after_fees(tmp_path):
+    app = _app(tmp_path, _ports())
+    app.startup(INSIDE)
+    app.tick(INSIDE)
+    assert [row["type"] for row in _lines(tmp_path / "fills.jsonl")] == ["fill"]
+    close = Decimal("1001")
+    app.twap.observe(TwapTick(price=close, timestamp_ms=(WINDOW + 900) * 1000 + 500))
+    app.tick(datetime.fromtimestamp(WINDOW + 900, tz=timezone.utc))
+    rows = _lines(tmp_path / "fills.jsonl")
+    assert [row["type"] for row in rows] == ["fill", "settlement"]
+    settlement = rows[1]
+    assert settlement["mode"] == "paper"
+    assert settlement["market"] == f"eth-updown-15m-{WINDOW}"
+    assert settlement["side"] == "Up"
+    assert settlement["outcome"] == "Up"
+    assert Decimal(settlement["open_price"]) == Decimal("1000")
+    assert Decimal(settlement["final_price"]) == close
+    assert Decimal(settlement["shares"]) == Decimal("5")
+    assert Decimal(settlement["price"]) == Decimal("0.40")
+    assert Decimal(settlement["notional"]) == Decimal("2.00")
+    assert Decimal(settlement["fee"]) == Decimal("0.036")
+    assert Decimal(settlement["realized_pnl"]) == Decimal("5") - Decimal("2.00") - Decimal("0.036")
+    assert settlement["realized_pnl"] == format(app.risk.realized, "f")
+    app.tick(datetime.fromtimestamp(WINDOW + 900 + 1, tz=timezone.utc))
+    assert [row["type"] for row in _lines(tmp_path / "fills.jsonl")] == ["fill", "settlement"]
+
+
+def test_losing_twap_close_logs_a_negative_pnl(tmp_path):
+    app = _app(tmp_path, _ports())
+    app.startup(INSIDE)
+    app.tick(INSIDE)
+    close = Decimal("999")
+    app.twap.observe(TwapTick(price=close, timestamp_ms=(WINDOW + 900) * 1000 + 500))
+    app.tick(datetime.fromtimestamp(WINDOW + 900, tz=timezone.utc))
+    settlement = _lines(tmp_path / "fills.jsonl")[1]
+    assert settlement["outcome"] == "Down"
+    assert Decimal(settlement["open_price"]) == Decimal("1000")
+    assert Decimal(settlement["final_price"]) == close
+    assert Decimal(settlement["realized_pnl"]) == -(Decimal(settlement["notional"]) + Decimal(settlement["fee"]))
+
+
+def test_official_final_price_is_the_one_written_when_gamma_has_published_it(tmp_path):
+    ports = _ports()
+    app = _app(tmp_path, ports)
+    app.startup(INSIDE)
+    app.tick(INSIDE)
+    event = ports.events[f"eth-updown-15m-{WINDOW}"]
+    event["eventMetadata"] = {"priceToBeat": "1000", "finalPrice": "1005"}
+    app.twap.observe(TwapTick(price=Decimal("999"), timestamp_ms=(WINDOW + 900) * 1000 + 500))
+    app.tick(datetime.fromtimestamp(WINDOW + 900, tz=timezone.utc))
+    settlement = _lines(tmp_path / "fills.jsonl")[1]
+    assert settlement["outcome"] == "Up"
+    assert Decimal(settlement["open_price"]) == Decimal("1000")
+    assert Decimal(settlement["final_price"]) == Decimal("1005")
+    assert Decimal(settlement["realized_pnl"]) == Decimal(settlement["shares"]) - (
+        Decimal(settlement["notional"]) + Decimal(settlement["fee"])
+    )
+
+
 def test_btc_payload_on_the_eth_slug_is_rejected(tmp_path):
     ports = _ports()
     ports.events[f"eth-updown-15m-{WINDOW}"] = eth_event(WINDOW, asset="btc", condition="condition-current")

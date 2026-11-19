@@ -93,3 +93,25 @@ def test_journal_drops_fields_outside_the_allowlist(tmp_path):
     assert "not-a-real-key" not in text
     assert "not-a-real-secret" not in text
     assert "private_key" not in text
+    journal.settlement(
+        {
+            "type": "settlement",
+            "ts": "2026-01-01T00:15:00+00:00",
+            "mode": "paper",
+            "market": "eth-updown-15m-1",
+            "side": "Up",
+            "outcome": "Down",
+            "open_price": "1000",
+            "final_price": "999",
+            "realized_pnl": "-2.036",
+            "shares": "5",
+            "price": "0.40",
+            "notional": "2",
+            "fee": "0.036",
+            "private_key": "not-a-real-key",
+        }
+    )
+    text = (tmp_path / "fills.jsonl").read_text(encoding="utf-8")
+    assert text.count("not-a-real-key") == 0
+    assert "outcome" in text
+    assert "realized_pnl" in text

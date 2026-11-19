@@ -47,10 +47,12 @@ Logs (directory override: `DESK_LOG_DIR`, default `logs/`):
 
 | File | Contents |
 | --- | --- |
-| `fills.jsonl` | Every paper fill |
+| `fills.jsonl` | Every paper fill, then a settlement line when that window resolves |
 | `heartbeat.jsonl` | One line at start and every 60 seconds |
 | `daily-summary.jsonl` | UTC day roll, shutdown, and FREEZE |
 | `startup.jsonl` | Fee formula and minimum size read at startup |
+
+A settlement line is appended to `fills.jsonl` when a bought window resolves. It records the outcome (`Up` or `Down`), the open and final prices the desk settled on, and that fill's realized P&L after fees. Up wins when the final price is greater than or equal to the open, including a tie. The final price is Gamma `finalPrice` when that official print is already present, otherwise the first public 60-second TWAP tick in the 5 seconds at the window end. The open is the same price used for fair odds. The line is not written before those prices exist.
 
 Ctrl-C writes the daily summary and exits.
 

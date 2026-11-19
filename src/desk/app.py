@@ -125,6 +125,11 @@ class DeskApp:
         summary = self.risk.ensure_day(now)
         if summary is not None:
             self.journal.daily(summary)
+        # Resolve the window already in hand before the clock rolls to the next one.
+        if self.session is not None:
+            self._refresh_official_prices()
+        if self.session is not None:
+            self._settle(now, self.session)
         try:
             self._ensure_window(now)
         except (StartupError, FeeScheduleError, MarketRejected, ValueError):
@@ -197,7 +202,29 @@ class DeskApp:
         open_price = self._open_price(market)
         if open_price is None or final_price is None:
             return
-        self.risk.settle(market.window_start, open_price, final_price)
+        moment = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        for item in self.risk.settle(market.window_start, open_price, final_price):
+            self.journal.settlement(
+                {
+                    "type": "settlement",
+                    "ts": moment.astimezone(timezone.utc).isoformat(),
+                    "mode": self.mode,
+                    "market": market.slug,
+                    "side": item.side,
+                    "outcome": item.outcome,
+                    "open_price": format(item.open_price, "f"),
+                    "final_price": format(item.final_price, "f"),
+                    "realized_pnl": format(item.realized_pnl, "f"),
+                    "shares": format(item.shares, "f"),
+                    "price": format(item.price, "f"),
+                    "notional": format(item.notional, "f"),
+                    "fee": format(item.fee, "f"),
+                }
+            )
+            print(
+                f"settle {item.outcome} {item.side} pnl {format(item.realized_pnl, 'f')} {market.slug}",
+                flush=True,
+            )
 
     def _consider_buys(self, now: datetime, session: Session) -> None:
         market = session.market

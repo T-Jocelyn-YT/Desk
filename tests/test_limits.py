@@ -234,6 +234,53 @@ def test_bankroll_rejects_when_cash_cannot_pay_for_the_order():
     assert decision.reason == "bankroll"
 
 
+def test_settlement_reports_outcome_open_final_and_pnl_after_fees():
+    state = initial_state()
+    bought = _decide(
+        state,
+        ask_price=Decimal("0.40"),
+        min_shares=Decimal("5"),
+        schedule=schedule("0.03"),
+    )
+    assert isinstance(bought, Approval)
+    state.record(WINDOW, bought)
+    cash_after_buy = state.cash
+    won = state.settle(WINDOW, Decimal("1000"), Decimal("1001"))
+    assert len(won) == 1
+    assert won[0].outcome == "Up"
+    assert won[0].open_price == Decimal("1000")
+    assert won[0].final_price == Decimal("1001")
+    assert won[0].realized_pnl == won[0].shares - won[0].notional - won[0].fee
+    assert state.realized == won[0].realized_pnl
+    assert state.cash == cash_after_buy + won[0].shares
+    assert state.settle(WINDOW, Decimal("1000"), Decimal("1001")) == []
+
+    loser = initial_state()
+    bought = _decide(
+        loser,
+        ask_price=Decimal("0.40"),
+        min_shares=Decimal("5"),
+        schedule=schedule("0.03"),
+    )
+    assert isinstance(bought, Approval)
+    loser.record(WINDOW, bought)
+    cash_after_buy = loser.cash
+    lost = loser.settle(WINDOW, Decimal("1000"), Decimal("999"))
+    assert lost[0].outcome == "Down"
+    assert lost[0].open_price == Decimal("1000")
+    assert lost[0].final_price == Decimal("999")
+    assert lost[0].realized_pnl == -(lost[0].notional + lost[0].fee)
+    assert loser.cash == cash_after_buy
+
+    tied = initial_state()
+    bought = _decide(tied, schedule=schedule("0"), min_shares=Decimal("1"))
+    assert isinstance(bought, Approval)
+    tied.record(WINDOW, bought)
+    tie = tied.settle(WINDOW, Decimal("100"), Decimal("100"))
+    assert tie[0].outcome == "Up"
+    assert tie[0].realized_pnl == tie[0].shares - tie[0].notional - tie[0].fee
+
+
 def test_tie_settles_up():
     state = initial_state()
     up = _decide(state, schedule=schedule("0"), min_shares=Decimal("1"))

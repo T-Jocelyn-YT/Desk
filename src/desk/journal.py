@@ -55,6 +55,22 @@ SUMMARY_KEYS = (
     "halt_reason",
 )
 
+SETTLEMENT_KEYS = (
+    "type",
+    "ts",
+    "mode",
+    "market",
+    "side",
+    "outcome",
+    "open_price",
+    "final_price",
+    "realized_pnl",
+    "shares",
+    "price",
+    "notional",
+    "fee",
+)
+
 STARTUP_KEYS = (
     "type",
     "ts",
@@ -80,6 +96,11 @@ class Journal:
 
     def fill(self, record: dict) -> None:
         self._write("fills.jsonl", FILL_KEYS, record)
+
+    def settlement(self, record: dict) -> None:
+        """Append one resolved fill to the same log as the buy."""
+
+        self._write("fills.jsonl", SETTLEMENT_KEYS, record)
 
     def heartbeat(self, record: dict) -> None:
         self._write("heartbeat.jsonl", HEARTBEAT_KEYS, record)
