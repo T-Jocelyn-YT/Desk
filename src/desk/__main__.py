@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from desk.app import DeskApp, FreezeStop, StartupError
 from desk.geoblock import GeoblockError
 from desk.journal import Journal
-from desk.live import LivePorts
+from desk.live import LivePorts, LiveRequestError
 from desk.mode import LiveTradingDisabled, public_settings
 from desk.risk import initial_state
 from desk.twap import TwapBook, start_rtds
@@ -48,11 +48,16 @@ def main(argv: list[str] | None = None) -> int:
     except StartupError as exc:
         print(str(exc), file=sys.stderr)
         return 5
+    except LiveRequestError as exc:
+        return _network_failure(exc)
 
     _thread, stop = start_rtds(app.twap)
     try:
         while True:
-            app.tick(datetime.now(timezone.utc))
+            try:
+                app.tick(datetime.now(timezone.utc))
+            except LiveRequestError as exc:
+                return _network_failure(exc)
             if settings.once:
                 break
             time.sleep(1)
@@ -67,6 +72,13 @@ def main(argv: list[str] | None = None) -> int:
         if settings.once:
             app.close(datetime.now(timezone.utc), "shutdown")
     return 0
+
+
+def _network_failure(exc: LiveRequestError) -> int:
+    """Exit after the read retries are used up. The message is the error class only."""
+
+    print(f"network request failed: {exc}", file=sys.stderr, flush=True)
+    return 6
 
 
 if __name__ == "__main__":

@@ -23,4 +23,6 @@ class PyClobBooks:
         self.client = client
 
     def order_book(self, token_id: str):
-        return self.client.get_order_book(token_id)
+        from desk.live import call_with_retry
+
+        return call_with_retry(lambda: self.client.get_order_book(token_id))
