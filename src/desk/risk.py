@@ -248,9 +248,14 @@ def decide(
     size = as_decimal(ask_size)
     if size < minimum:
         return Rejection("book")
-    desired = max(PER_BET_USD / price, minimum)
-    shares = min(desired, size)
+    # The per-bet cap is not raised to the exchange minimum. If the
+    # minimum itself costs more than the cap, skip the order.
+    if minimum * price > PER_BET_USD:
+        return Rejection("per_bet")
+    shares = min(PER_BET_USD / price, size)
     notional = shares * price
+    if shares < minimum or notional > PER_BET_USD:
+        return Rejection("per_bet")
     fee = schedule.fee(shares, price)
     if state.window_notional(window_start) + notional > WINDOW_CAP_USD:
         return Rejection("window_cap")
