@@ -41,7 +41,9 @@ On startup the process:
 1. Stops immediately when a `FREEZE` file is present (path override: `DESK_FREEZE_FILE`). Exit code 3. A daily summary is written first.
 2. Calls `https://polymarket.com/api/geoblock`. If `blocked` is true, or the check does not return a usable `blocked: false`, the process refuses to run. Exit code 2. The detected IP is not printed or logged.
 3. Loads the current 15-minute ETH up/down event from Gamma (rules text, `cryptoMarketConfig`, `feeSchedule`, `orderMinSize`, `eventMetadata`) and the CLOB market (`fd`, `mos`) plus the order book minimum from `py-clob-client`.
-4. Subscribes to the public RTDS socket `wss://ws-live-data.polymarket.com`, topic `crypto_prices_twap_sixty`, symbol `eth/usd`. Fair odds use `full_accuracy_value` (E18 integer string). The socket is public. This build does not use the credentialed PolyBolt socket.
+4. Subscribes to the public RTDS socket `wss://ws-live-data.polymarket.com`, topic `crypto_prices_twap_sixty`, symbol `eth/usd`. Fair odds use `full_accuracy_value` (E18 integer string). The socket is public. This build does not use the credentialed PolyBolt socket. The socket reader already reconnects on its own.
+
+Gamma, CLOB, geoblock, and order-book reads retry a dropped SSL connection or a URL disconnect. The policy is three attempts, with 0.2s and then 0.5s between them. An HTTP response (including 4xx and 5xx), a certificate failure, a geoblock refusal, a `FREEZE` file, and a request to run live mode are not retried. If the attempts are used up on a Gamma, CLOB, or order-book read, the process prints the error class and exits 6. A geoblock check that still fails is a refusal, exit 2. Neither path prints a traceback, a URL, or an address. The public RTDS loop is unchanged.
 
 Logs (directory override: `DESK_LOG_DIR`, default `logs/`):
 
@@ -130,5 +132,6 @@ A buy lifts the current best ask and nothing behind it. Size is the smaller of t
 | 3 | FREEZE file |
 | 4 | Live mode or a credential flag was requested |
 | 5 | Market rules, fee, or minimum size could not be read |
+| 6 | A network read still failed after the SSL/URL retries |
 
 This repository does not deploy the terminal, provision a server, or turn live trading on.
