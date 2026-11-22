@@ -26,7 +26,7 @@ def _ports(rate: str = "0.03", exponent: str = "1", mos: str = "5") -> FakePorts
     )
     ports.events[event["slug"]] = event
     ports.clob["condition-current"] = clob_info(rate=rate, exponent=exponent, mos=mos)
-    ports.books["token-up"] = Book([{"price": "0.40", "size": "20"}], min_order_size=mos)
+    ports.books["token-up"] = Book([{"price": "0.20", "size": "20"}], min_order_size=mos)
     ports.books["token-down"] = Book([{"price": "0.90", "size": "20"}], min_order_size=mos)
     ports.settled = settled_series(WINDOW)
     return ports
@@ -55,13 +55,46 @@ def test_paper_fill_uses_best_ask_size_and_the_mocked_fee(tmp_path):
     fill = json.loads((tmp_path / "fills.jsonl").read_text(encoding="utf-8"))
     assert fill["mode"] == "paper"
     assert fill["side"] == "Up"
-    assert fill["price"] == "0.40"
+    assert fill["price"] == "0.20"
     assert fill["shares"] == "5"
-    assert Decimal(fill["notional"]) == Decimal("2.00")
-    assert Decimal(fill["fee"]) == Decimal("0.036")
+    assert Decimal(fill["notional"]) == Decimal("1.00")
+    assert Decimal(fill["fee"]) == Decimal("0.024")
     assert fill["fee_rate"] == "0.03"
     assert fill["market"] == f"eth-updown-15m-{WINDOW}"
     assert "203.0.113.42" not in (tmp_path / "fills.jsonl").read_text(encoding="utf-8")
+
+
+def test_five_shares_above_the_per_bet_cap_are_skipped_without_a_fill_or_freeze(tmp_path):
+    ports = _ports()
+    ports.books["token-up"] = Book([{"price": "0.22", "size": "20"}], min_order_size="5")
+    ports.books["token-down"] = Book([{"price": "0.22", "size": "20"}], min_order_size="5")
+    freeze = tmp_path / "FREEZE"
+    app = DeskApp(ports, Journal(tmp_path), freeze_file=freeze)
+    app.twap.observe(TwapTick(price=Decimal("1100"), timestamp_ms=int(INSIDE.timestamp()) * 1000))
+    app.startup(INSIDE)
+    app.tick(INSIDE)
+    app.tick(INSIDE + timedelta(seconds=3))
+    assert not (tmp_path / "fills.jsonl").exists()
+    assert not freeze.exists()
+    assert app.risk.halted is False
+    assert app.risk.cash == Decimal("50")
+    assert app.risk.positions == []
+    assert app.risk.fills_today == 0
+
+
+def test_five_share_minimum_that_fits_the_per_bet_cap_still_fills(tmp_path):
+    freeze = tmp_path / "FREEZE"
+    ports = _ports()
+    app = DeskApp(ports, Journal(tmp_path), freeze_file=freeze)
+    app.twap.observe(TwapTick(price=Decimal("1100"), timestamp_ms=int(INSIDE.timestamp()) * 1000))
+    app.startup(INSIDE)
+    app.tick(INSIDE)
+    fill = json.loads((tmp_path / "fills.jsonl").read_text(encoding="utf-8"))
+    assert fill["shares"] == "5"
+    assert fill["price"] == "0.20"
+    assert Decimal(fill["notional"]) == Decimal("1.00")
+    assert not freeze.exists()
+    assert app.risk.halted is False
 
 
 def test_fee_disagreement_refuses_startup(tmp_path):
@@ -151,7 +184,7 @@ def test_missing_price_to_beat_uses_the_boundary_tick_without_blocking(tmp_path)
     app.tick(INSIDE)
     fill = json.loads((tmp_path / "fills.jsonl").read_text(encoding="utf-8"))
     assert fill["side"] == "Up"
-    assert fill["price"] == "0.40"
+    assert fill["price"] == "0.20"
 
 
 def _lines(path):
@@ -176,10 +209,10 @@ def test_twap_close_writes_a_settlement_line_with_pnl_after_fees(tmp_path):
     assert Decimal(settlement["open_price"]) == Decimal("1000")
     assert Decimal(settlement["final_price"]) == close
     assert Decimal(settlement["shares"]) == Decimal("5")
-    assert Decimal(settlement["price"]) == Decimal("0.40")
-    assert Decimal(settlement["notional"]) == Decimal("2.00")
-    assert Decimal(settlement["fee"]) == Decimal("0.036")
-    assert Decimal(settlement["realized_pnl"]) == Decimal("5") - Decimal("2.00") - Decimal("0.036")
+    assert Decimal(settlement["price"]) == Decimal("0.20")
+    assert Decimal(settlement["notional"]) == Decimal("1.00")
+    assert Decimal(settlement["fee"]) == Decimal("0.024")
+    assert Decimal(settlement["realized_pnl"]) == Decimal("5") - Decimal("1.00") - Decimal("0.024")
     assert settlement["realized_pnl"] == format(app.risk.realized, "f")
     app.tick(datetime.fromtimestamp(WINDOW + 900 + 1, tz=timezone.utc))
     assert [row["type"] for row in _lines(tmp_path / "fills.jsonl")] == ["fill", "settlement"]

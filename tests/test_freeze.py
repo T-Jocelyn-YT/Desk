@@ -21,7 +21,7 @@ def _ready() -> FakePorts:
     event = eth_event(WINDOW, price_to_beat="1000")
     ports.events[event["slug"]] = event
     ports.clob[event["markets"][0]["conditionId"]] = clob_info()
-    ports.books["token-up"] = Book([{"price": "0.40", "size": "20"}])
+    ports.books["token-up"] = Book([{"price": "0.20", "size": "20"}])
     ports.books["token-down"] = Book([{"price": "0.90", "size": "20"}])
     ports.settled = settled_series(WINDOW)
     return ports

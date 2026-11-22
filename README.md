@@ -110,18 +110,18 @@ These are constants in `src/desk/limits.py`. The code enforces them. Display con
 | Rule | Value |
 | --- | --- |
 | Bankroll | $50 starting cash. A buy whose cost exceeds remaining cash or $50 is rejected. |
-| Per bet | 2% ($1), raised to the exchange minimum share size read at startup |
+| Per bet | 2% ($1) of notional. Size is at most that cap. If the exchange minimum (shares × price) would cost more than $1, the order is skipped and not filled. |
 | Per window | 10% ($5) of notional in that 15-minute window |
 | Daily stop | 6% ($3). No new buy whose worst case (notional + fee), together with open worst case and realized P&L, would push the UTC day through −$3. The stop clears on the next UTC day. |
 | Price ceiling | 72¢. A higher ask is rejected. 72¢ is allowed by this rule. |
 | Clock | Buy only in the last 4 minutes of the window (240 seconds remaining through 1 second remaining) |
 | Edge | Fee-adjusted fair odds must beat the ask by at least 6 points |
 
-A 5-share buy at 72¢ is about $3.60 before fees. That price passes the ceiling and the $5 window cap, and it fails the $3 daily stop, so the desk does not place it. A 5-share buy at 50¢ is $2.50 before fees and can pass on a fresh day. The share minimum is the value read from Gamma `orderMinSize`, CLOB `mos`, and the order book's `min_order_size`. Those three must agree. The desk does not assume the minimum stays at 5 shares.
+A 5-share buy is skipped when 5 × price is more than $1. At 22¢ that minimum is $1.10, so it is not filled. At 20¢ the minimum is $1 and can pass on a fresh day, subject to the other rules. A 5-share buy at 72¢ is also above the $1 cap, so it is skipped before the daily stop is considered. An ask above 72¢ is still rejected by the price ceiling. The daily stop still rejects a buy that fits under $1 when the day's remaining room cannot cover its worst case. The share minimum is the value read from Gamma `orderMinSize`, CLOB `mos`, and the order book's `min_order_size`. Those three must agree. The desk does not assume the minimum stays at 5 shares.
 
 ## Paper fills
 
-A buy lifts the current best ask and nothing behind it. Size is the smaller of the sized order and the shares displayed at that price. If that size is below the exchange minimum, there is no fill. The taker fee from the startup schedule is charged. Nothing is posted to the CLOB.
+A buy lifts the current best ask and nothing behind it. Size is the smaller of the sized order and the shares displayed at that price. If that size is below the exchange minimum, there is no fill. If the exchange minimum would cost more than the $1 per-bet cap, the order is skipped before any fill. The taker fee from the startup schedule is charged on a fill that is taken. Nothing is posted to the CLOB.
 
 ## Exit codes
 

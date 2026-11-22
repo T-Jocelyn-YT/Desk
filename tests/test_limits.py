@@ -104,23 +104,56 @@ def test_zero_fee_schedule_accepts_an_exact_six_point_edge():
     assert decision.edge == Decimal("0.06")
 
 
-def test_per_bet_is_one_dollar_unless_the_exchange_minimum_is_larger():
+def test_per_bet_stays_at_one_dollar_when_the_minimum_fits():
     small_minimum = _decide(initial_state(), ask_price=Decimal("0.10"), min_shares=Decimal("5"))
     assert isinstance(small_minimum, Approval)
     assert small_minimum.shares == Decimal("10")
     assert small_minimum.notional == Decimal("1.0")
 
-    raised = _decide(initial_state(), ask_price=Decimal("0.50"), min_shares=Decimal("5"))
-    assert isinstance(raised, Approval)
-    assert raised.shares == Decimal("5")
-    assert raised.notional == Decimal("2.50")
+    exact = _decide(initial_state(), ask_price=Decimal("0.20"), min_shares=Decimal("5"))
+    assert isinstance(exact, Approval)
+    assert exact.shares == Decimal("5")
+    assert exact.notional == Decimal("1.00")
+
+
+def test_minimum_that_costs_more_than_the_per_bet_cap_is_skipped():
+    # 5 shares at 22¢ is $1.10, above the $1 cap.
+    state = initial_state()
+    skipped = _decide(state, ask_price=Decimal("0.22"), min_shares=Decimal("5"))
+    assert isinstance(skipped, Rejection)
+    assert skipped.reason == "per_bet"
+    assert state.positions == []
+    assert state.halted is False
+    assert state.cash == BANKROLL_USD
+
+    above = _decide(initial_state(), ask_price=Decimal("0.50"), min_shares=Decimal("5"))
+    assert isinstance(above, Rejection)
+    assert above.reason == "per_bet"
+
+    seventy_two = _decide(initial_state(), ask_price=Decimal("0.72"), min_shares=Decimal("5"))
+    assert isinstance(seventy_two, Rejection)
+    assert seventy_two.reason == "per_bet"
 
 
 def test_minimum_order_size_is_the_value_passed_in_not_a_constant_five():
-    decision = _decide(initial_state(), ask_price=Decimal("0.30"), min_shares=Decimal("8"))
-    assert isinstance(decision, Approval)
-    assert decision.shares == Decimal("8")
-    assert decision.notional == Decimal("2.40")
+    blocked = _decide(
+        initial_state(),
+        ask_price=Decimal("0.10"),
+        ask_size=Decimal("6"),
+        min_shares=Decimal("8"),
+    )
+    assert isinstance(blocked, Rejection)
+    assert blocked.reason == "book"
+
+    taken = _decide(
+        initial_state(),
+        ask_price=Decimal("0.10"),
+        ask_size=Decimal("8"),
+        min_shares=Decimal("8"),
+    )
+    assert isinstance(taken, Approval)
+    assert taken.shares == Decimal("8")
+    assert taken.notional == Decimal("0.80")
 
 
 def test_book_smaller_than_the_minimum_is_not_a_fill():
@@ -166,35 +199,36 @@ def test_window_cap_rejects_when_prior_stake_in_the_window_leaves_too_little_roo
     assert decision.reason == "window_cap"
 
 
-def test_daily_stop_blocks_a_second_minimum_bet_and_a_72_cent_minimum_bet():
+def test_daily_stop_blocks_another_bet_once_open_risk_reaches_three_dollars():
     state = initial_state()
-    first = _decide(state, ask_price=Decimal("0.50"), min_shares=Decimal("5"))
-    assert isinstance(first, Approval)
-    assert first.notional == Decimal("2.50")
-    state.record(WINDOW, first)
-    second = _decide(state, ask_price=Decimal("0.50"), min_shares=Decimal("5"))
-    assert isinstance(second, Rejection)
-    assert second.reason == "daily_stop"
+    for _ in range(3):
+        decision = _decide(state, ask_price=Decimal("0.20"), min_shares=Decimal("5"))
+        assert isinstance(decision, Approval)
+        assert decision.notional == Decimal("1.00")
+        state.record(WINDOW, decision)
+    blocked = _decide(state, ask_price=Decimal("0.20"), min_shares=Decimal("5"))
+    assert isinstance(blocked, Rejection)
+    assert blocked.reason == "daily_stop"
 
-    seventy_two = _decide(initial_state(), ask_price=Decimal("0.72"), min_shares=Decimal("5"))
+    seventy_two = _decide(state, ask_price=Decimal("0.72"), min_shares=Decimal("1"))
     assert isinstance(seventy_two, Rejection)
     assert seventy_two.reason == "daily_stop"
 
 
 def test_daily_stop_resets_on_the_next_utc_day_and_cash_stays_reduced():
     state = initial_state()
-    first = _decide(state, ask_price=Decimal("0.50"), min_shares=Decimal("5"), schedule=schedule("0"))
+    first = _decide(state, ask_price=Decimal("0.20"), min_shares=Decimal("5"), schedule=schedule("0"))
     state.record(WINDOW, first)
     state.settle(WINDOW, Decimal("2"), Decimal("1"))
-    assert state.realized == Decimal("-2.50")
-    assert state.cash == Decimal("47.50")
+    assert state.realized == Decimal("-1.00")
+    assert state.cash == Decimal("49.00")
     later = INSIDE + timedelta(days=1)
     later_window = WINDOW + (24 * 60 * 60)
     decision = _decide(
         state,
         now=later,
         window_start=later_window,
-        ask_price=Decimal("0.50"),
+        ask_price=Decimal("0.20"),
         min_shares=Decimal("5"),
         schedule=schedule("0"),
     )
@@ -204,7 +238,7 @@ def test_daily_stop_resets_on_the_next_utc_day_and_cash_stays_reduced():
 def test_bankroll_rejects_when_cash_cannot_pay_for_the_order():
     state = initial_state()
     day = datetime(2026, 1, 1, 15, tzinfo=timezone.utc)
-    for index in range(20):
+    for index in range(50):
         now = day + timedelta(days=index)
         timestamp = int(now.timestamp())
         window = timestamp + 120 - 900
@@ -212,7 +246,7 @@ def test_bankroll_rejects_when_cash_cannot_pay_for_the_order():
             state,
             now=datetime.fromtimestamp(timestamp, tz=timezone.utc),
             window_start=window,
-            ask_price=Decimal("0.50"),
+            ask_price=Decimal("0.20"),
             min_shares=Decimal("5"),
             schedule=schedule("0"),
         )
@@ -220,13 +254,13 @@ def test_bankroll_rejects_when_cash_cannot_pay_for_the_order():
         state.record(window, decision)
         state.settle(window, Decimal("2"), Decimal("1"))
     assert state.cash == Decimal("0")
-    broke = day + timedelta(days=20)
+    broke = day + timedelta(days=50)
     timestamp = int(broke.timestamp())
     decision = _decide(
         state,
         now=datetime.fromtimestamp(timestamp, tz=timezone.utc),
         window_start=timestamp + 120 - 900,
-        ask_price=Decimal("0.50"),
+        ask_price=Decimal("0.20"),
         min_shares=Decimal("5"),
         schedule=schedule("0"),
     )
@@ -238,7 +272,7 @@ def test_settlement_reports_outcome_open_final_and_pnl_after_fees():
     state = initial_state()
     bought = _decide(
         state,
-        ask_price=Decimal("0.40"),
+        ask_price=Decimal("0.20"),
         min_shares=Decimal("5"),
         schedule=schedule("0.03"),
     )
@@ -258,7 +292,7 @@ def test_settlement_reports_outcome_open_final_and_pnl_after_fees():
     loser = initial_state()
     bought = _decide(
         loser,
-        ask_price=Decimal("0.40"),
+        ask_price=Decimal("0.20"),
         min_shares=Decimal("5"),
         schedule=schedule("0.03"),
     )
