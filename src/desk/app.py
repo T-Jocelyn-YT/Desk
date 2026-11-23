@@ -11,7 +11,7 @@ from desk.fair import probability_down, probability_up
 from desk.fees import FeeSchedule, FeeScheduleError, fee_schedule_from_clob, reconcile_fees
 from desk.geoblock import GeoblockError, parse_geoblock
 from desk.journal import Journal
-from desk.limits import ENTRY_SECONDS
+from desk.limits import ENTRY_SECONDS, WINDOW_SECONDS
 from desk.markets import Market, MarketRejected, parse_market, slug_for, window_start_of
 from desk.numbers import as_decimal
 from desk.paper import best_ask, book_min_shares, paper_fill
@@ -114,7 +114,7 @@ class DeskApp:
 
     def startup(self, now: datetime) -> None:
         parse_geoblock(self.ports.geoblock())  # type: ignore[attr-defined]
-        self.risk.ensure_day(now)
+        self.risk.replay(self.journal.read_fills(), now)
         self.session = load_session(self.ports, now)
         self._log_startup(now)
 
@@ -125,11 +125,10 @@ class DeskApp:
         summary = self.risk.ensure_day(now)
         if summary is not None:
             self.journal.daily(summary)
-        # Resolve the window already in hand before the clock rolls to the next one.
+        # Resolve windows already in hand before the clock rolls to the next one.
         if self.session is not None:
             self._refresh_official_prices()
-        if self.session is not None:
-            self._settle(now, self.session)
+        self._settle(now, self.session)
         try:
             self._ensure_window(now)
         except (StartupError, FeeScheduleError, MarketRejected, ValueError):
@@ -190,26 +189,51 @@ class DeskApp:
             ),
         )
 
-    def _settle(self, now: datetime, session: Session) -> None:
-        market = session.market
+    def _settle(self, now: datetime, session: Session | None) -> None:
+        """Settle every open window whose open and close are already known.
+
+        A window that ended before Gamma or the boundary TWAP had published
+        its prices stays open and is tried again on later ticks. The close
+        is Gamma `finalPrice` when that print is present, otherwise the
+        first public 60-second TWAP tick in the 5 seconds at the window end.
+        """
+
+        pending: list[int] = []
+        seen: set[int] = set()
+        for position in self.risk.positions:
+            if position.settled or position.window_start in seen:
+                continue
+            seen.add(position.window_start)
+            pending.append(position.window_start)
+        for window_start in sorted(pending):
+            self._settle_window(now, window_start, session)
+
+    def _settle_window(self, now: datetime, window_start: int, session: Session | None) -> None:
+        market = self._market_for_window(window_start, session)
+        window_end = market.window_end if market is not None else window_start + WINDOW_SECONDS
         now_ts = int(now.timestamp())
-        if market.final_price is not None:
+        if market is not None and market.final_price is not None:
             final_price = market.final_price
-        elif now_ts >= market.window_end:
-            final_price = self.twap.close_price(market.window_end)
+        elif now_ts >= window_end:
+            final_price = self.twap.close_price(window_end)
         else:
             return
-        open_price = self._open_price(market)
+        if market is not None:
+            open_price = self._open_price(market)
+            slug = market.slug
+        else:
+            open_price = self._resolve_open(window_start, None)
+            slug = slug_for(window_start)
         if open_price is None or final_price is None:
             return
         moment = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
-        for item in self.risk.settle(market.window_start, open_price, final_price):
+        for item in self.risk.settle(window_start, open_price, final_price):
             self.journal.settlement(
                 {
                     "type": "settlement",
                     "ts": moment.astimezone(timezone.utc).isoformat(),
                     "mode": self.mode,
-                    "market": market.slug,
+                    "market": slug,
                     "side": item.side,
                     "outcome": item.outcome,
                     "open_price": format(item.open_price, "f"),
@@ -222,9 +246,20 @@ class DeskApp:
                 }
             )
             print(
-                f"settle {item.outcome} {item.side} pnl {format(item.realized_pnl, 'f')} {market.slug}",
+                f"settle {item.outcome} {item.side} pnl {format(item.realized_pnl, 'f')} {slug}",
                 flush=True,
             )
+
+    def _market_for_window(self, window_start: int, session: Session | None) -> Market | None:
+        if session is not None and session.market.window_start == window_start:
+            return session.market
+        event = self.ports.event(slug_for(window_start))  # type: ignore[attr-defined]
+        if not isinstance(event, dict):
+            return None
+        try:
+            return parse_market(event)
+        except MarketRejected:
+            return None
 
     def _consider_buys(self, now: datetime, session: Session) -> None:
         market = session.market
@@ -297,9 +332,11 @@ class DeskApp:
             )
 
     def _open_price(self, market: Market) -> Decimal | None:
+        return self._resolve_open(market.window_start, market.price_to_beat)
+
+    def _resolve_open(self, window_start: int, price_to_beat: Decimal | None) -> Decimal | None:
         prior = None
-        window_length = market.window_end - market.window_start
-        previous = self.ports.event(slug_for(market.window_start - window_length))  # type: ignore[attr-defined]
+        previous = self.ports.event(slug_for(window_start - WINDOW_SECONDS))  # type: ignore[attr-defined]
         if isinstance(previous, dict):
             try:
                 prior_market = parse_market(previous)
@@ -307,7 +344,7 @@ class DeskApp:
                 prior_market = None
             if prior_market is not None:
                 prior = prior_market.final_price
-        return resolve_open(market.price_to_beat, prior, self.twap.open_price(market.window_start))
+        return resolve_open(price_to_beat, prior, self.twap.open_price(window_start))
 
     def _heartbeat(self, now: datetime) -> None:
         if self._last_beat is not None and (now - self._last_beat).total_seconds() < 60:

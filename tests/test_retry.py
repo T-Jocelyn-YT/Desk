@@ -55,7 +55,8 @@ def _paper_ports() -> FakePorts:
     event = eth_event(WINDOW, price_to_beat="1000", condition="condition-current")
     ports.events[event["slug"]] = event
     ports.clob["condition-current"] = clob_info()
-    ports.books["token-up"] = Book([{"price": "0.40", "size": "20"}])
+    # 5 shares at 20¢ is $1, so the per-bet cap still allows the fill.
+    ports.books["token-up"] = Book([{"price": "0.20", "size": "20"}])
     ports.books["token-down"] = Book([{"price": "0.90", "size": "20"}])
     ports.settled = settled_series(WINDOW)
     return ports
@@ -346,7 +347,7 @@ def test_tick_survives_a_gamma_disconnect_and_still_fills(tmp_path, monkeypatch)
     assert fill["mode"] == "paper"
     assert fill["side"] == "Up"
     assert fill["shares"] == "5"
-    assert fill["price"] == "0.40"
+    assert fill["price"] == "0.20"
     assert state["slug_calls"] >= 3
     assert state["sleeps"] == [0.2]
     assert DOC_IP not in (tmp_path / "fills.jsonl").read_text(encoding="utf-8")

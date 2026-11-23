@@ -102,6 +102,30 @@ class Journal:
 
         self._write("fills.jsonl", SETTLEMENT_KEYS, record)
 
+    def read_fills(self) -> list[dict]:
+        """Fill and settlement lines, in append order.
+
+        A torn or non-JSON line is skipped. The writer only appends
+        complete lines, so a crash mid-write cannot drop the earlier book.
+        """
+
+        path = self.directory / "fills.jsonl"
+        with self._lock:
+            if not path.exists():
+                return []
+            text = path.read_text(encoding="utf-8")
+        rows: list[dict] = []
+        for line in text.splitlines():
+            if line.strip() == "":
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                rows.append(record)
+        return rows
+
     def heartbeat(self, record: dict) -> None:
         self._write("heartbeat.jsonl", HEARTBEAT_KEYS, record)
 
