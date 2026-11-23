@@ -153,14 +153,14 @@ class RiskState:
         return summary
 
     def replay(self, records: list[dict], now: datetime) -> None:
-        """Restore the book from this UTC day's fill and settlement lines.
+        """Restore the book from fills.jsonl using the daily-stop day roll.
 
-        The day key is `trading_day`, the same boundary `ensure_day`
-        uses (00:00 UTC / 08:00 Asia/Shanghai). Lines from any other day
-        are not applied, so a restart after the roll does not carry the
-        previous day's realized P&L into the new stop. Cash, open
-        positions, window exposure, and the stop are whatever today's
-        lines imply, starting from the bankroll.
+        Every fill and settlement is applied in order, starting from the
+        bankroll. `ensure_day` rolls the UTC day (00:00 UTC, 08:00
+        Asia/Shanghai) and resets realized P&L, the halt, and the day's
+        counters. It does not reset cash or positions, so a restart after
+        the roll starts from the previous day's ending cash and does not
+        put that day's realized P&L into the new stop.
         """
 
         self.cash = BANKROLL_USD
@@ -172,7 +172,6 @@ class RiskState:
         self.notional_today = Decimal("0")
         self.fees_today = Decimal("0")
         self.day = ""
-        today = trading_day(now)
         moment = _as_utc(now)
         for record in records:
             if not isinstance(record, dict):
@@ -180,8 +179,9 @@ class RiskState:
             if str(record.get("mode") or "paper") != "paper":
                 continue
             timestamp = _parse_time(record.get("ts"))
-            if timestamp is None or timestamp > moment or trading_day(timestamp) != today:
+            if timestamp is None or timestamp > moment:
                 continue
+            self.ensure_day(timestamp)
             kind = record.get("type")
             try:
                 if kind == "fill":

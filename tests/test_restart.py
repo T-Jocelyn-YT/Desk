@@ -237,16 +237,24 @@ def test_restart_across_the_utc_day_does_not_carry_the_previous_stop(tmp_path):
     next_day = datetime.fromtimestamp(w3 + WINDOW_SECONDS - 120, tz=timezone.utc)
     assert trading_day(next_day) == "2026-11-23"
     assert next_day.astimezone(SHANGHAI) == datetime(2026, 11, 23, 8, 13, tzinfo=SHANGHAI)
+    ending_cash = app.risk.cash
     rolled = _start(tmp_path, ports, next_day)
+    assert ending_cash == Decimal("47")
+    assert rolled.risk.cash == ending_cash
+    assert rolled.risk.cash != BANKROLL_USD
     assert rolled.risk.realized == Decimal("0")
-    assert rolled.risk.cash == BANKROLL_USD
     assert rolled.risk.halted is False
     assert rolled.risk.halt_reason is None
-    assert rolled.risk.positions == []
     assert rolled.risk.fills_today == 0
+    assert rolled.risk.notional_today == Decimal("0")
+    assert rolled.risk.fees_today == Decimal("0")
+    assert rolled.risk.open_worst() == Decimal("0")
     assert rolled.risk.daily_room() == DAILY_STOP_USD
+    assert len(rolled.risk.positions) == 3
+    assert all(position.settled for position in rolled.risk.positions)
     rolled.tick(next_day)
     assert rolled.risk.fills_today == 1
+    assert rolled.risk.cash == ending_cash - Decimal("1")
     assert rolled.risk.halted is False
     assert rolled.risk.realized == Decimal("0")
     assert [row["type"] for row in _lines(tmp_path / "fills.jsonl") if row["type"] == "fill"][-1] == "fill"
