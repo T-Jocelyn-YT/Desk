@@ -189,6 +189,8 @@ def test_missed_previous_window_settles_from_the_boundary_twap(tmp_path):
 def test_restart_across_the_utc_day_does_not_carry_the_previous_stop(tmp_path):
     # 00:00 UTC is 08:00 Asia/Shanghai. A fill at 07:13 Shanghai is still the
     # previous UTC day. A restart at 08:13 Shanghai is the next one.
+    # The daily stop is a fixed $10. Each window holds at most $5, so the
+    # loss that trips it is ten $1 fills in the 23:00 and 23:15 UTC windows.
     boundary = datetime(2026, 11, 23, 0, 0, tzinfo=timezone.utc)
     assert boundary.astimezone(SHANGHAI) == datetime(2026, 11, 23, 8, 0, tzinfo=SHANGHAI)
     assert trading_day(boundary - timedelta(seconds=1)) == "2026-11-22"
@@ -197,35 +199,53 @@ def test_restart_across_the_utc_day_does_not_carry_the_previous_stop(tmp_path):
     first = datetime(2026, 11, 22, 23, 0, tzinfo=timezone.utc)
     w1 = window_start_of(first)
     w2 = w1 + WINDOW_SECONDS
+    w_late = w2 + WINDOW_SECONDS
     w3 = window_start_of(boundary)
-    ports = _ports(w1, w2, w3, rate="0")
+    ports = _ports(w1, w2, w_late, w3, rate="0")
     inside = datetime.fromtimestamp(w1 + WINDOW_SECONDS - 120, tz=timezone.utc)
     assert trading_day(inside) == "2026-11-22"
     assert inside.astimezone(SHANGHAI) == datetime(2026, 11, 23, 7, 13, tzinfo=SHANGHAI)
 
     app = _start(tmp_path, ports, inside)
-    for offset in range(3):
+    for offset in range(5):
         app.tick(inside + timedelta(seconds=offset))
-    assert app.risk.fills_today == 3
+    assert app.risk.fills_today == 5
     app.twap.observe(TwapTick(price=Decimal("999"), timestamp_ms=(w1 + WINDOW_SECONDS) * 1000 + 500))
     app.tick(datetime.fromtimestamp(w1 + WINDOW_SECONDS, tz=timezone.utc))
-    assert app.risk.realized == Decimal("-3")
-    assert app.risk.cash == Decimal("47")
+    assert app.risk.realized == Decimal("-5")
+    assert app.risk.cash == Decimal("45")
+    assert app.risk.halted is False
+    assert all(position.settled for position in app.risk.positions)
+
+    # The close print replaced the spot. Put the spot back above the open
+    # before the next window's buys, without treating it as that window's open.
+    app.twap.observe(TwapTick(price=Decimal("1100"), timestamp_ms=(w2 + 60) * 1000))
+    inside_w2 = datetime.fromtimestamp(w2 + WINDOW_SECONDS - 120, tz=timezone.utc)
+    assert trading_day(inside_w2) == "2026-11-22"
+    assert inside_w2.astimezone(SHANGHAI) == datetime(2026, 11, 23, 7, 28, tzinfo=SHANGHAI)
+    for offset in range(5):
+        app.tick(inside_w2 + timedelta(seconds=offset))
+    assert app.risk.fills_today == 10
+    app.twap.observe(TwapTick(price=Decimal("999"), timestamp_ms=(w2 + WINDOW_SECONDS) * 1000 + 500))
+    app.tick(datetime.fromtimestamp(w2 + WINDOW_SECONDS, tz=timezone.utc))
+    assert app.risk.realized == Decimal("-10")
+    assert app.risk.cash == Decimal("40")
     assert app.risk.halted is True
     assert app.risk.halt_reason == "daily_stop"
     assert all(position.settled for position in app.risk.positions)
 
-    same_day = datetime.fromtimestamp(w2 + WINDOW_SECONDS - 120, tz=timezone.utc)
+    same_day = datetime.fromtimestamp(w_late + WINDOW_SECONDS - 120, tz=timezone.utc)
     assert trading_day(same_day) == "2026-11-22"
-    assert same_day.astimezone(SHANGHAI) == datetime(2026, 11, 23, 7, 28, tzinfo=SHANGHAI)
+    assert same_day.astimezone(SHANGHAI) == datetime(2026, 11, 23, 7, 43, tzinfo=SHANGHAI)
     restored = _start(tmp_path, ports, same_day)
-    assert restored.risk.realized == Decimal("-3")
-    assert restored.risk.cash == Decimal("47")
+    assert restored.risk.realized == Decimal("-10")
+    assert restored.risk.cash == Decimal("40")
     assert restored.risk.halted is True
     assert restored.risk.halt_reason == "daily_stop"
     assert restored.risk.daily_room() == DAILY_STOP_USD + restored.risk.realized
-    assert restored.risk.window_notional(w1) == Decimal("3")
-    assert len(restored.risk.positions) == 3
+    assert restored.risk.window_notional(w1) == Decimal("5")
+    assert restored.risk.window_notional(w2) == Decimal("5")
+    assert len(restored.risk.positions) == 10
     before = _types(tmp_path / "fills.jsonl")
     restored.tick(same_day)
     assert _types(tmp_path / "fills.jsonl") == before
@@ -239,7 +259,7 @@ def test_restart_across_the_utc_day_does_not_carry_the_previous_stop(tmp_path):
     assert next_day.astimezone(SHANGHAI) == datetime(2026, 11, 23, 8, 13, tzinfo=SHANGHAI)
     ending_cash = app.risk.cash
     rolled = _start(tmp_path, ports, next_day)
-    assert ending_cash == Decimal("47")
+    assert ending_cash == Decimal("40")
     assert rolled.risk.cash == ending_cash
     assert rolled.risk.cash != BANKROLL_USD
     assert rolled.risk.realized == Decimal("0")
@@ -250,7 +270,7 @@ def test_restart_across_the_utc_day_does_not_carry_the_previous_stop(tmp_path):
     assert rolled.risk.fees_today == Decimal("0")
     assert rolled.risk.open_worst() == Decimal("0")
     assert rolled.risk.daily_room() == DAILY_STOP_USD
-    assert len(rolled.risk.positions) == 3
+    assert len(rolled.risk.positions) == 10
     assert all(position.settled for position in rolled.risk.positions)
     rolled.tick(next_day)
     assert rolled.risk.fills_today == 1

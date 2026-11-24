@@ -10,11 +10,11 @@ from decimal import Decimal
 BANKROLL_USD = Decimal("50")
 PER_BET_FRACTION = Decimal("0.02")
 PER_WINDOW_FRACTION = Decimal("0.10")
-DAILY_STOP_FRACTION = Decimal("0.06")
 
 PER_BET_USD = BANKROLL_USD * PER_BET_FRACTION
 WINDOW_CAP_USD = BANKROLL_USD * PER_WINDOW_FRACTION
-DAILY_STOP_USD = BANKROLL_USD * DAILY_STOP_FRACTION
+# Fixed dollar amount. It does not move when the bankroll changes.
+DAILY_STOP_USD = Decimal("10")
 
 PRICE_CEILING = Decimal("0.72")
 EDGE_POINTS = Decimal("0.06")
