@@ -112,7 +112,7 @@ These are constants in `src/desk/limits.py`. The code enforces them. Display con
 | Bankroll | $50 starting cash. A buy whose cost exceeds remaining cash or $50 is rejected. |
 | Per bet | 2% ($1) of notional. Size is at most that cap. If the exchange minimum (shares × price) would cost more than $1, the order is skipped and not filled. |
 | Per window | 10% ($5) of notional in that 15-minute window |
-| Daily stop | 6% ($3). No new buy whose worst case (notional + fee), together with open worst case and realized P&L, would push the UTC day through −$3. The stop clears on the next UTC day. |
+| Daily stop | $10 fixed. No new buy whose worst case (notional + fee), together with open worst case and realized P&L, would push the UTC day through −$10. The stop clears on the next UTC day. |
 | Price ceiling | 72¢. A higher ask is rejected. 72¢ is allowed by this rule. |
 | Clock | Buy only in the last 4 minutes of the window (240 seconds remaining through 1 second remaining) |
 | Edge | Fee-adjusted fair odds must beat the ask by at least 6 points |

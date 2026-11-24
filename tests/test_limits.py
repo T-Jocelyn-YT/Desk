@@ -8,6 +8,7 @@ from desk.limits import (
     PER_BET_USD,
     PRICE_CEILING,
     WINDOW_CAP_USD,
+    WINDOW_SECONDS,
     displayed_limits,
 )
 from desk.risk import Approval, Position, Rejection, decide, initial_state
@@ -41,8 +42,8 @@ def test_displayed_limits_match_the_constants_and_do_not_set_them():
     assert PER_BET_USD == Decimal("1.00")
     assert shown["window_cap_usd"] == "5.00"
     assert WINDOW_CAP_USD == Decimal("5")
-    assert shown["daily_stop_usd"] == "3.00"
-    assert DAILY_STOP_USD == Decimal("3")
+    assert shown["daily_stop_usd"] == "10"
+    assert DAILY_STOP_USD == Decimal("10")
     assert shown["price_ceiling"] == "0.72"
     assert PRICE_CEILING == Decimal("0.72")
     assert shown["edge_points"] == "0.06"
@@ -199,18 +200,44 @@ def test_window_cap_rejects_when_prior_stake_in_the_window_leaves_too_little_roo
     assert decision.reason == "window_cap"
 
 
-def test_daily_stop_blocks_another_bet_once_open_risk_reaches_three_dollars():
+def test_daily_stop_blocks_another_bet_once_open_risk_reaches_ten_dollars():
+    # The window cap is $5, so the $10 stop takes two windows of $1 buys.
     state = initial_state()
-    for _ in range(3):
-        decision = _decide(state, ask_price=Decimal("0.20"), min_shares=Decimal("5"))
-        assert isinstance(decision, Approval)
-        assert decision.notional == Decimal("1.00")
-        state.record(WINDOW, decision)
-    blocked = _decide(state, ask_price=Decimal("0.20"), min_shares=Decimal("5"))
+    for index in range(2):
+        window = WINDOW + index * WINDOW_SECONDS
+        now = datetime.fromtimestamp(window + WINDOW_SECONDS - 120, tz=timezone.utc)
+        for _ in range(5):
+            decision = _decide(
+                state,
+                now=now,
+                window_start=window,
+                ask_price=Decimal("0.20"),
+                min_shares=Decimal("5"),
+            )
+            assert isinstance(decision, Approval)
+            assert decision.notional == Decimal("1.00")
+            state.record(window, decision)
+    assert state.open_worst() == Decimal("10.00")
+    assert state.daily_room() == Decimal("0.00")
+    next_window = WINDOW + 2 * WINDOW_SECONDS
+    next_now = datetime.fromtimestamp(next_window + WINDOW_SECONDS - 120, tz=timezone.utc)
+    blocked = _decide(
+        state,
+        now=next_now,
+        window_start=next_window,
+        ask_price=Decimal("0.20"),
+        min_shares=Decimal("5"),
+    )
     assert isinstance(blocked, Rejection)
     assert blocked.reason == "daily_stop"
 
-    seventy_two = _decide(state, ask_price=Decimal("0.72"), min_shares=Decimal("1"))
+    seventy_two = _decide(
+        state,
+        now=next_now,
+        window_start=next_window,
+        ask_price=Decimal("0.72"),
+        min_shares=Decimal("1"),
+    )
     assert isinstance(seventy_two, Rejection)
     assert seventy_two.reason == "daily_stop"
 
