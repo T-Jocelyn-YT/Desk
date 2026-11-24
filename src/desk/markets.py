@@ -57,6 +57,17 @@ def slug_for(start: int) -> str:
     return f"eth-updown-15m-{start}"
 
 
+def window_start_from_slug(slug: object) -> int | None:
+    """Inverse of the window slug. Unknown slugs are not a window."""
+
+    if not isinstance(slug, str):
+        return None
+    match = _SLUG_RE.fullmatch(slug)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
 def _loads_maybe(value: object) -> object:
     if isinstance(value, str):
         text = value.strip()
