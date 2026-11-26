@@ -320,12 +320,15 @@ def test_operator_morning_cash_locks_the_owner_stop_and_ignores_a_later_line(tmp
     app = _start(tmp_path, ports, INSIDE)
     assert app.risk.morning_cash == Decimal("309.82909")
     assert app.risk.daily_stop == Decimal("61.96582")
-    assert app.risk.cash == Decimal("309.82909")
+    # The file locks the stop. It does not replace book cash. The heartbeat
+    # matches the bankroll replay, so cash stays there.
+    assert app.risk.cash == BANKROLL_USD
+    assert app.risk.cash != Decimal("309.82909")
     assert app.risk.halted is False
     app.tick(INSIDE)
     assert app.risk.daily_stop == Decimal("61.96582")
     assert app.risk.morning_cash == Decimal("309.82909")
-    assert app.risk.cash < Decimal("309.82909")
+    assert app.risk.cash < BANKROLL_USD
     fill = _lines(tmp_path / "fills.jsonl")[0]
     assert fill["type"] == "fill"
     assert Decimal(fill["notional"]) == Decimal("1.00")
@@ -336,6 +339,7 @@ def test_operator_morning_cash_locks_the_owner_stop_and_ignores_a_later_line(tmp
     assert restored.risk.daily_stop == Decimal("61.96582")
     assert restored.risk.morning_cash == Decimal("309.82909")
     assert restored.risk.cash == after_fill
+    assert restored.risk.cash != Decimal("309.82909")
     assert (tmp_path / "morning-cash.jsonl").read_text(encoding="utf-8") == written
 
 
@@ -415,3 +419,85 @@ def test_morning_journal_drops_fields_outside_the_allowlist(tmp_path):
     assert "not-a-real-key" not in text
     assert "private_key" not in text
     assert "309.82909" in text
+
+
+def test_operator_line_locks_the_stop_and_keeps_the_latest_heartbeat_cash(tmp_path):
+    # 17:23:56 Asia/Shanghai is 09:23:56 UTC, still 2026-11-26.
+    shanghai_beat = datetime(2026, 11, 26, 17, 23, 56, tzinfo=SHANGHAI)
+    beat = shanghai_beat.astimezone(timezone.utc)
+    assert beat == datetime(2026, 11, 26, 9, 23, 56, tzinfo=timezone.utc)
+    assert trading_day(beat) == "2026-11-26"
+    later = datetime(2026, 11, 26, 12, 0, tzinfo=timezone.utc)
+    assert trading_day(later) == "2026-11-26"
+    start = window_start_of(later)
+    ports = _ports(start)
+    (tmp_path / "morning-cash.jsonl").write_text(
+        json.dumps({"date": "2026-11-26", "cash": "309.82909"}) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "heartbeat.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "heartbeat",
+                "ts": beat.isoformat(),
+                "mode": "paper",
+                "cash": "294.80981",
+                "realized_pnl": "0",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    app = _start(tmp_path, ports, later)
+    assert app.risk.morning_cash == Decimal("309.82909")
+    assert app.risk.daily_stop == Decimal("61.96582")
+    assert app.risk.cash == Decimal("294.80981")
+    assert app.risk.cash != Decimal("309.82909")
+    assert app.risk.realized == Decimal("0")
+    assert len(_lines(tmp_path / "morning-cash.jsonl")) == 1
+
+    fill_ts = datetime(2026, 11, 26, 10, 0, tzinfo=timezone.utc)
+    with (tmp_path / "fills.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "fill",
+                    "ts": fill_ts.isoformat(),
+                    "mode": "paper",
+                    "market": slug_for(start),
+                    "side": "Up",
+                    "price": "0.20",
+                    "shares": "5",
+                    "notional": "1.00",
+                    "fee": "0",
+                }
+            )
+            + "\n"
+        )
+    carried = _start(tmp_path, ports, later)
+    assert carried.risk.cash == Decimal("293.80981")
+    assert carried.risk.cash != Decimal("308.82909")
+    assert carried.risk.daily_stop == Decimal("61.96582")
+    assert carried.risk.morning_cash == Decimal("309.82909")
+
+    later_beat = datetime(2026, 11, 26, 11, 0, tzinfo=timezone.utc)
+    with (tmp_path / "heartbeat.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "heartbeat",
+                    "ts": later_beat.isoformat(),
+                    "mode": "paper",
+                    "cash": "280.00000",
+                    "realized_pnl": "-4.50000",
+                }
+            )
+            + "\n"
+        )
+    corrected = _start(tmp_path, ports, later)
+    assert corrected.risk.cash == Decimal("280")
+    assert corrected.risk.realized == Decimal("-4.50000")
+    assert corrected.risk.daily_stop == Decimal("61.96582")
+    assert corrected.risk.morning_cash == Decimal("309.82909")
+    assert corrected.risk.halted is False
+    assert len(_lines(tmp_path / "morning-cash.jsonl")) == 1

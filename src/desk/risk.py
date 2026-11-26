@@ -143,9 +143,10 @@ class MorningLock:
     """One UTC day's locked stop.
 
     `authority` is `operator` for a hand-written line and `journal` for a
-    line the desk recorded. Operator cash is the morning base. A journal
-    line keeps the stop from being recomputed and still lets heartbeats
-    correct an incomplete fill log.
+    line the desk recorded. The cash on the line is the stop base only.
+    It does not replace book cash. Fills, settlements, and verified
+    heartbeats still move cash and realized P&L. They do not recompute a
+    stop that is already locked for the UTC day.
     """
 
     day: str
@@ -256,7 +257,7 @@ class RiskState:
             self.notional_today = Decimal("0")
             self.fees_today = Decimal("0")
         if entering:
-            created = self._lock_day(key, adopt_explicit_cash=replay_boundary)
+            created = self._lock_day(key)
             self._set_provisional(created, replay_boundary=replay_boundary)
         self._halt_if_stopped()
         return summary
@@ -399,8 +400,12 @@ class RiskState:
             self._halt_if_stopped()
             return
 
-    def _lock_day(self, day: str, *, adopt_explicit_cash: bool) -> bool:
-        """Install the day's stop. Return whether this call created it."""
+    def _lock_day(self, day: str) -> bool:
+        """Install the day's stop. Return whether this call created it.
+
+        A line from morning-cash.jsonl supplies the stop base only. Book
+        cash stays on the fill and settlement replay.
+        """
 
         lock = self.locks.get(day)
         created = lock is None
@@ -416,13 +421,6 @@ class RiskState:
             self.locks[day] = lock
         self.morning_cash = lock.cash
         self.daily_stop = lock.stop
-        if (
-            adopt_explicit_cash
-            and lock.authority == "operator"
-            and lock.cash is not None
-            and quantize_money(self.cash) != lock.cash
-        ):
-            self.cash = lock.cash
         return created
 
     def _set_provisional(self, created: bool, *, replay_boundary: bool) -> None:
@@ -457,16 +455,12 @@ class RiskState:
 
         A heartbeat written in the same second as a fill or settlement
         matches either the cash before those rows or the cash after them.
-        Operator-supplied morning cash is left in place.
+        A morning-cash line locks the stop only, so a later heartbeat may
+        still correct book cash and realized P&L.
         """
 
         observed_cash, observed_realized = self._heartbeat_observation(record)
         if observed_cash is None:
-            return
-        lock = self.locks.get(self.day)
-        if lock is not None and lock.authority == "operator" and lock.cash is not None:
-            self._morning_provisional = False
-            self._verified_observation = True
             return
         cash_ok = observed_cash == cash_before or observed_cash == cash_after
         realized_ok = (
