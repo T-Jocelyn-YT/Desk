@@ -3,15 +3,25 @@ from decimal import Decimal
 
 from desk.limits import (
     BANKROLL_USD,
-    DAILY_STOP_USD,
+    DAILY_STOP_FRACTION,
     EDGE_POINTS,
+    ENTRY_SECONDS,
     PER_BET_USD,
     PRICE_CEILING,
     WINDOW_CAP_USD,
     WINDOW_SECONDS,
+    daily_stop_from_cash,
     displayed_limits,
+    quantize_money,
 )
-from desk.risk import Approval, Position, Rejection, decide, initial_state
+from desk.risk import (
+    Approval,
+    Position,
+    Rejection,
+    decide,
+    initial_state,
+    morning_lock_from_record,
+)
 from tests.support import schedule
 
 WINDOW = 1_700_002_800
@@ -42,8 +52,9 @@ def test_displayed_limits_match_the_constants_and_do_not_set_them():
     assert PER_BET_USD == Decimal("1.00")
     assert shown["window_cap_usd"] == "5.00"
     assert WINDOW_CAP_USD == Decimal("5")
-    assert shown["daily_stop_usd"] == "10"
-    assert DAILY_STOP_USD == Decimal("10")
+    assert shown["daily_stop_fraction"] == "0.20"
+    assert DAILY_STOP_FRACTION == Decimal("0.20")
+    assert "daily_stop_usd" not in shown
     assert shown["price_ceiling"] == "0.72"
     assert PRICE_CEILING == Decimal("0.72")
     assert shown["edge_points"] == "0.06"
@@ -201,7 +212,8 @@ def test_window_cap_rejects_when_prior_stake_in_the_window_leaves_too_little_roo
 
 
 def test_daily_stop_blocks_another_bet_once_open_risk_reaches_ten_dollars():
-    # The window cap is $5, so the $10 stop takes two windows of $1 buys.
+    # A fresh book locks 20% of the $50 bankroll, which is $10.
+    # The window cap is $5, so that stop takes two windows of $1 buys.
     state = initial_state()
     for index in range(2):
         window = WINDOW + index * WINDOW_SECONDS
@@ -260,39 +272,27 @@ def test_daily_stop_resets_on_the_next_utc_day_and_cash_stays_reduced():
         schedule=schedule("0"),
     )
     assert isinstance(decision, Approval)
+    assert state.daily_stop == daily_stop_from_cash(Decimal("49.00"))
+    assert state.morning_cash == quantize_money(Decimal("49.00"))
 
 
 def test_bankroll_rejects_when_cash_cannot_pay_for_the_order():
+    # Morning cash is the $50 bankroll, so the locked stop is $10 and still
+    # has room. The order is rejected because cash cannot pay for it.
     state = initial_state()
-    day = datetime(2026, 1, 1, 15, tzinfo=timezone.utc)
-    for index in range(50):
-        now = day + timedelta(days=index)
-        timestamp = int(now.timestamp())
-        window = timestamp + 120 - 900
-        decision = _decide(
-            state,
-            now=datetime.fromtimestamp(timestamp, tz=timezone.utc),
-            window_start=window,
-            ask_price=Decimal("0.20"),
-            min_shares=Decimal("5"),
-            schedule=schedule("0"),
-        )
-        assert isinstance(decision, Approval), decision
-        state.record(window, decision)
-        state.settle(window, Decimal("2"), Decimal("1"))
-    assert state.cash == Decimal("0")
-    broke = day + timedelta(days=50)
-    timestamp = int(broke.timestamp())
+    state.ensure_day(INSIDE)
+    assert state.daily_stop == daily_stop_from_cash(BANKROLL_USD)
+    state.cash = Decimal("0.50")
     decision = _decide(
         state,
-        now=datetime.fromtimestamp(timestamp, tz=timezone.utc),
-        window_start=timestamp + 120 - 900,
         ask_price=Decimal("0.20"),
         min_shares=Decimal("5"),
         schedule=schedule("0"),
     )
     assert isinstance(decision, Rejection)
     assert decision.reason == "bankroll"
+    assert state.positions == []
+    assert state.cash == Decimal("0.50")
 
 
 def test_settlement_reports_outcome_open_final_and_pnl_after_fees():
@@ -361,3 +361,220 @@ def test_tie_settles_up():
     assert up_position.settled and down_position.settled
     # Tie resolves Up. Each side was a $1 notional. Up pays 2 (two shares).
     assert state.cash == Decimal("50")
+
+
+def _heartbeat(ts: str, cash: str, realized: str = "0") -> dict:
+    return {
+        "type": "heartbeat",
+        "ts": ts,
+        "mode": "paper",
+        "cash": cash,
+        "realized_pnl": realized,
+    }
+
+
+def _fill(ts: str, notional: str = "1.00") -> dict:
+    return {
+        "type": "fill",
+        "ts": ts,
+        "mode": "paper",
+        "market": "eth-updown-15m-1700000000",
+        "side": "Up",
+        "price": "0.20",
+        "shares": "5",
+        "notional": notional,
+        "fee": "0",
+    }
+
+
+def test_twenty_percent_of_owner_morning_cash_rounds_to_the_usdc_quantum():
+    # 309.82909 * 0.20 = 61.965818, which rounds half up to 61.96582.
+    morning = Decimal("309.82909")
+    assert daily_stop_from_cash(morning) == Decimal("61.96582")
+    assert quantize_money(morning) == morning
+
+
+def test_daily_stop_locks_once_and_rolls_at_08_00_shanghai():
+    shanghai = timezone(timedelta(hours=8))
+    before = datetime(2026, 11, 26, 7, 59, tzinfo=shanghai)
+    at_open = datetime(2026, 11, 26, 8, 0, tzinfo=shanghai)
+    assert before.astimezone(timezone.utc) == datetime(2026, 11, 25, 23, 59, tzinfo=timezone.utc)
+    assert at_open.astimezone(timezone.utc) == datetime(2026, 11, 26, 0, 0, tzinfo=timezone.utc)
+
+    state = initial_state()
+    state.cash = Decimal("309.82909")
+    state.ensure_day(before)
+    assert state.day == "2026-11-25"
+    assert state.morning_cash == Decimal("309.82909")
+    assert state.daily_stop == Decimal("61.96582")
+    state.positions.append(
+        Position(
+            window_start=WINDOW,
+            side="Up",
+            shares=Decimal("1"),
+            price=Decimal("0.20"),
+            notional=Decimal("0.20"),
+            fee=Decimal("0"),
+            settled=True,
+        )
+    )
+    state.cash = Decimal("200")
+    state.realized = Decimal("-9")
+    state.halted = True
+    state.halt_reason = "daily_stop"
+    state.fills_today = 4
+    state.ensure_day(before + timedelta(seconds=30))
+    assert state.daily_stop == Decimal("61.96582")
+    assert state.morning_cash == Decimal("309.82909")
+    assert state.halted is True
+
+    summary = state.ensure_day(at_open)
+    assert summary is not None
+    assert summary["date"] == "2026-11-25"
+    assert state.day == "2026-11-26"
+    assert state.realized == Decimal("0")
+    assert state.halted is False
+    assert state.halt_reason is None
+    assert state.fills_today == 0
+    assert state.cash == Decimal("200")
+    assert len(state.positions) == 1
+    assert state.morning_cash == quantize_money(Decimal("200"))
+    assert state.daily_stop == daily_stop_from_cash(Decimal("200"))
+    state.cash = Decimal("10")
+    state.ensure_day(datetime(2026, 11, 26, 9, 0, tzinfo=shanghai))
+    assert state.daily_stop == daily_stop_from_cash(Decimal("200"))
+    assert state.cash == Decimal("10")
+    assert BANKROLL_USD == Decimal("50")
+    assert PER_BET_USD == Decimal("1.00")
+    assert WINDOW_CAP_USD == Decimal("5")
+    assert PRICE_CEILING == Decimal("0.72")
+    assert EDGE_POINTS == Decimal("0.06")
+    assert ENTRY_SECONDS == 4 * 60
+
+
+def test_locked_stop_allows_a_loss_past_ten_dollars_and_blocks_at_the_locked_amount():
+    state = initial_state()
+    state.cash = Decimal("309.82909")
+    state.ensure_day(INSIDE)
+    assert state.daily_stop == Decimal("61.96582")
+    state.cash = Decimal("40")
+    state.realized = Decimal("-10")
+    allowed = _decide(
+        state,
+        ask_price=Decimal("0.20"),
+        min_shares=Decimal("5"),
+        schedule=schedule("0"),
+    )
+    assert isinstance(allowed, Approval)
+    assert state.daily_stop == Decimal("61.96582")
+    assert state.halted is False
+
+    blocked_state = initial_state()
+    blocked_state.cash = Decimal("309.82909")
+    blocked_state.ensure_day(INSIDE)
+    blocked_state.realized = Decimal("-61.90")
+    blocked = _decide(
+        blocked_state,
+        ask_price=Decimal("0.20"),
+        min_shares=Decimal("5"),
+        schedule=schedule("0"),
+    )
+    assert isinstance(blocked, Rejection)
+    assert blocked.reason == "daily_stop"
+
+    halted = initial_state()
+    halted.cash = Decimal("309.82909")
+    halted.ensure_day(INSIDE)
+    halted.realized = Decimal("-61.96582")
+    halted.ensure_day(INSIDE)
+    assert halted.halted is True
+    assert halted.halt_reason == "daily_stop"
+    assert halted.daily_stop == Decimal("61.96582")
+
+
+def test_incomplete_log_uses_the_last_verified_cash_not_zero():
+    # Two heartbeats before 00:00 UTC. The fill log never explains the cash.
+    # The gap between them is not zero P&L, and the missing prefix is not $0
+    # or the $50 bankroll.
+    now = datetime(2026, 11, 26, 1, 0, tzinfo=timezone.utc)
+    state = initial_state()
+    state.replay(
+        [],
+        now,
+        heartbeats=[
+            _heartbeat("2026-11-25T22:00:00+00:00", "100.00000", "0"),
+            _heartbeat("2026-11-25T23:30:00+00:00", "80.00000", "-20.00000"),
+        ],
+    )
+    assert state.day == "2026-11-26"
+    assert state.cash == Decimal("80")
+    assert state.morning_cash == Decimal("80")
+    assert state.daily_stop == daily_stop_from_cash(Decimal("80"))
+    assert state.daily_stop == Decimal("16")
+    assert state.realized == Decimal("0")
+    assert state.halted is False
+    assert state.cash != BANKROLL_USD
+    assert state.cash != Decimal("0")
+    assert state.morning_cash != Decimal("100")
+
+
+def test_same_day_gap_keeps_the_locked_stop_and_does_not_zero_pnl():
+    # The 02:00 fill is in the log. The 06:00 heartbeat does not match that
+    # fill, so the stretch is missing: cash and P&L come from the heartbeat,
+    # and the stop stays at 20% of the 00:30 verification.
+    now = datetime(2026, 11, 26, 12, 0, tzinfo=timezone.utc)
+    state = initial_state()
+    state.replay(
+        [_fill("2026-11-26T02:00:00+00:00")],
+        now,
+        heartbeats=[
+            _heartbeat("2026-11-26T00:30:00+00:00", "100.00000", "0"),
+            _heartbeat("2026-11-26T06:00:00+00:00", "70.00000", "-30.00000"),
+        ],
+    )
+    assert state.morning_cash == Decimal("100")
+    assert state.daily_stop == Decimal("20")
+    assert state.daily_stop != daily_stop_from_cash(Decimal("70"))
+    assert state.cash == Decimal("70")
+    assert state.realized == Decimal("-30")
+    assert state.halted is True
+    assert state.halt_reason == "daily_stop"
+
+
+def test_fill_after_the_morning_lock_does_not_recompute_the_stop():
+    now = datetime(2026, 11, 26, 3, 0, tzinfo=timezone.utc)
+    state = initial_state()
+    state.replay(
+        [_fill("2026-11-26T02:00:00+00:00", "1.00")],
+        now,
+        heartbeats=[_heartbeat("2026-11-26T00:30:00+00:00", "309.82909", "0")],
+    )
+    assert state.morning_cash == Decimal("309.82909")
+    assert state.daily_stop == Decimal("61.96582")
+    assert state.cash == Decimal("308.82909")
+    assert state.halted is False
+
+
+def test_morning_lock_record_prefers_cash_and_ignores_a_second_install():
+    day = "2026-11-26"
+    both = morning_lock_from_record(
+        {"date": day, "cash": "309.82909", "daily_stop_usd": "10", "private_key": "nope"}
+    )
+    assert both is not None
+    assert both.cash == Decimal("309.82909")
+    assert both.stop == Decimal("61.96582")
+    assert both.authority == "operator"
+    stop_only = morning_lock_from_record({"date": day, "daily_stop_usd": "61.96582"})
+    assert stop_only is not None
+    assert stop_only.cash is None
+    assert stop_only.stop == Decimal("61.96582")
+    assert morning_lock_from_record({"date": "2026-13-01", "cash": "1"}) is None
+    assert morning_lock_from_record({"date": day, "cash": "-1"}) is None
+    assert morning_lock_from_record("{not-json") is None
+
+    state = initial_state()
+    assert both is not None and stop_only is not None
+    state.install_lock(both)
+    state.install_lock(stop_only)
+    assert state.locks[day].stop == Decimal("61.96582")
+    assert state.locks[day].cash == Decimal("309.82909")
