@@ -87,6 +87,16 @@ STARTUP_KEYS = (
     "sigma_windows",
 )
 
+# First line for a UTC date is the lock. Operators may write that line
+# before the process starts. The desk appends one when it locks the day.
+MORNING_KEYS = (
+    "type",
+    "date",
+    "cash",
+    "daily_stop_usd",
+    "source",
+)
+
 
 class Journal:
     def __init__(self, directory: Path) -> None:
@@ -109,7 +119,25 @@ class Journal:
         complete lines, so a crash mid-write cannot drop the earlier book.
         """
 
-        path = self.directory / "fills.jsonl"
+        return self._read_jsonl("fills.jsonl")
+
+    def read_heartbeats(self) -> list[dict]:
+        """Heartbeat lines, in append order. Torn lines are skipped."""
+
+        return self._read_jsonl("heartbeat.jsonl")
+
+    def read_morning_cash(self) -> list[dict]:
+        """Morning-cash locks, in append order. Torn lines are skipped."""
+
+        return self._read_jsonl("morning-cash.jsonl")
+
+    def morning(self, record: dict) -> None:
+        """Append one locked morning cash row. The first line for a date wins."""
+
+        self._write("morning-cash.jsonl", MORNING_KEYS, record)
+
+    def _read_jsonl(self, name: str) -> list[dict]:
+        path = self.directory / name
         with self._lock:
             if not path.exists():
                 return []

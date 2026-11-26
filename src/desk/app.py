@@ -15,7 +15,7 @@ from desk.limits import ENTRY_SECONDS, WINDOW_SECONDS
 from desk.markets import Market, MarketRejected, parse_market, slug_for, window_start_of
 from desk.numbers import as_decimal
 from desk.paper import best_ask, book_min_shares, paper_fill
-from desk.risk import Approval, RiskState, initial_state, decide
+from desk.risk import Approval, RiskState, decide, initial_state, morning_lock_from_record
 from desk.twap import TwapBook, resolve_open
 from desk.volatility import Volatility, volatility_from_events
 
@@ -114,7 +114,13 @@ class DeskApp:
 
     def startup(self, now: datetime) -> None:
         parse_geoblock(self.ports.geoblock())  # type: ignore[attr-defined]
-        self.risk.replay(self.journal.read_fills(), now)
+        self._load_morning_locks()
+        self.risk.replay(
+            self.journal.read_fills(),
+            now,
+            heartbeats=self.journal.read_heartbeats(),
+        )
+        self._persist_morning_locks()
         self.session = load_session(self.ports, now)
         self._log_startup(now)
 
@@ -125,6 +131,7 @@ class DeskApp:
         summary = self.risk.ensure_day(now)
         if summary is not None:
             self.journal.daily(summary)
+            self._persist_morning_locks()
         # Resolve windows already in hand before the clock rolls to the next one.
         if self.session is not None:
             self._refresh_official_prices()
@@ -146,6 +153,28 @@ class DeskApp:
         self._closed = True
         self.risk.ensure_day(now)
         self.journal.daily(self.risk.summary(reason))
+        self._persist_morning_locks()
+
+    def _load_morning_locks(self) -> None:
+        for record in self.journal.read_morning_cash():
+            lock = morning_lock_from_record(record)
+            if lock is not None:
+                self.risk.install_lock(lock)
+
+    def _persist_morning_locks(self) -> None:
+        for lock in self.risk.locks.values():
+            if not lock.dirty or lock.cash is None:
+                continue
+            self.journal.morning(
+                {
+                    "type": "morning_cash",
+                    "date": lock.day,
+                    "cash": format(lock.cash, "f"),
+                    "daily_stop_usd": format(lock.stop, "f"),
+                    "source": "journal",
+                }
+            )
+            lock.dirty = False
 
     def _freeze_present(self) -> bool:
         if self.freeze_file is None:

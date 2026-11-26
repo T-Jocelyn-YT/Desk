@@ -50,13 +50,30 @@ Logs (directory override: `DESK_LOG_DIR`, default `logs/`):
 | File | Contents |
 | --- | --- |
 | `fills.jsonl` | Every paper fill, then a settlement line when that window resolves |
-| `heartbeat.jsonl` | One line at start and every 60 seconds |
+| `heartbeat.jsonl` | One line at start and every 60 seconds. `cash` and `realized_pnl` are verified readings |
+| `morning-cash.jsonl` | Locked morning cash and daily stop for each UTC day. The first line for a date wins |
 | `daily-summary.jsonl` | UTC day roll, shutdown, and FREEZE |
 | `startup.jsonl` | Fee formula and minimum size read at startup |
 
 A settlement line is appended to `fills.jsonl` when a bought window resolves. It records the outcome (`Up` or `Down`), the open and final prices the desk settled on, and that fill's realized P&L after fees. Up wins when the final price is greater than or equal to the open, including a tie. The final price is Gamma `finalPrice` when that official print is already present, otherwise the first public 60-second TWAP tick in the 5 seconds at the window end. The open is the same price used for fair odds. The line is not written before those prices exist.
 
 Ctrl-C writes the daily summary and exits.
+
+## Daily stop input
+
+At 00:00 UTC (08:00 Asia/Shanghai) the desk locks the daily stop at 20% of that morning's verified total cash. The lock does not move if cash changes later that UTC day. The next UTC day locks a new stop from the cash carried into that morning.
+
+USDC amounts, including that 20% figure, are rounded to 5 decimal places, half up. That is the same quantum the taker fee uses. The fee-specific rule that a rounded fee below 0.00001 is zero does not apply to the stop.
+
+The desk reads `morning-cash.jsonl` from the log directory. The first valid line for a UTC date is the lock. Later lines for that date are ignored. To supply the base for the running UTC day, put the line in the file before the process starts, and before any line the desk has already written for that date:
+
+```json
+{"date": "YYYY-MM-DD", "cash": "309.82909"}
+```
+
+`date` is the UTC day. `cash` is the morning total. The stop is 20% of that cash after the rounding above. For cash `309.82909` the locked stop is `61.96582`. A line may instead set `daily_stop_usd` when the cash total is not at hand. If both are present, `cash` wins and the stop is computed from it. A hand-written line (no `"source": "journal"`) is authoritative for that day: fills and settlements after 00:00 UTC still move cash, and a heartbeat does not replace the supplied morning cash.
+
+If the file has no line for today, the desk uses the journal. Heartbeats record verified cash and realized P&L. When the fill log does not meet a heartbeat, that stretch is missing: it is not booked as zero cash or zero P&L. The desk keeps the last verified cash and then locks the stop once. A line the desk writes itself has `"source": "journal"`. On a later start that line keeps the stop fixed, while heartbeats can still correct cash if the fill log is incomplete.
 
 ## What it trades
 
@@ -105,14 +122,14 @@ The 6-point rule is `edge = fair − fee_per_share − book_price`. Buy only whe
 
 ## Hard limits
 
-These are constants in `src/desk/limits.py`. The code enforces them. Display config cannot widen them.
+These are constants in `src/desk/limits.py`. The daily stop's dollar amount is not a constant: it is 20% of that morning's verified cash. The code enforces the rules. Display config cannot widen them.
 
 | Rule | Value |
 | --- | --- |
 | Bankroll | $50 starting cash. A buy whose cost exceeds remaining cash or $50 is rejected. |
 | Per bet | 2% ($1) of notional. Size is at most that cap. If the exchange minimum (shares × price) would cost more than $1, the order is skipped and not filled. |
 | Per window | 10% ($5) of notional in that 15-minute window |
-| Daily stop | $10 fixed. No new buy whose worst case (notional + fee), together with open worst case and realized P&L, would push the UTC day through −$10. The stop clears on the next UTC day. |
+| Daily stop | 20% of the UTC day's morning-verified total cash, locked at 00:00 UTC (08:00 Asia/Shanghai). It does not change as cash moves later that day. No new buy whose worst case (notional + fee), together with open worst case and realized P&L, would push the UTC day through −that locked amount. The next UTC day clears realized P&L, the halt, and the day's counters, and locks a new stop from the cash carried into that morning. Cash and positions are not reset. |
 | Price ceiling | 72¢. A higher ask is rejected. 72¢ is allowed by this rule. |
 | Clock | Buy only in the last 4 minutes of the window (240 seconds remaining through 1 second remaining) |
 | Edge | Fee-adjusted fair odds must beat the ask by at least 6 points |

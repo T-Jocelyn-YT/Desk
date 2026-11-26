@@ -1,22 +1,28 @@
-"""Hard-limit checks. Every threshold is a constant in desk.limits."""
+"""Hard-limit checks.
+
+Thresholds other than the daily stop's dollar amount are constants in
+desk.limits. The daily stop is 20% of the UTC day's morning-verified
+cash and stays at that figure until the next 00:00 UTC.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from desk.fair import edge_points
 from desk.fees import FeeSchedule
 from desk.limits import (
     BANKROLL_USD,
-    DAILY_STOP_USD,
     EDGE_POINTS,
     ENTRY_SECONDS,
     PER_BET_USD,
     PRICE_CEILING,
     WINDOW_CAP_USD,
     WINDOW_SECONDS,
+    daily_stop_from_cash,
+    quantize_money,
 )
 from desk.markets import window_start_from_slug
 from desk.numbers import as_decimal
@@ -108,6 +114,88 @@ def _parse_time(value: object) -> datetime | None:
     return _as_utc(parsed)
 
 
+def _parse_day(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return None
+    if parsed.strftime("%Y-%m-%d") != value:
+        return None
+    return value
+
+
+def _finite_money(value: object, *, allow_negative: bool = False) -> Decimal | None:
+    try:
+        amount = quantize_money(as_decimal(value))
+    except (ValueError, InvalidOperation, ArithmeticError):
+        return None
+    if not amount.is_finite():
+        return None
+    if amount < 0 and not allow_negative:
+        return None
+    return amount
+
+
+@dataclass
+class MorningLock:
+    """One UTC day's locked stop.
+
+    `authority` is `operator` for a hand-written line and `journal` for a
+    line the desk recorded. Operator cash is the morning base. A journal
+    line keeps the stop from being recomputed and still lets heartbeats
+    correct an incomplete fill log.
+    """
+
+    day: str
+    cash: Decimal | None
+    stop: Decimal
+    authority: str
+    dirty: bool = False
+
+
+def morning_lock_from_record(record: object) -> MorningLock | None:
+    """Parse one morning-cash line. Invalid lines are ignored.
+
+    When `cash` is present the stop is 20% of that cash. A supplied
+    `daily_stop_usd` is used only when cash is absent. The first parsed
+    line for a date is the lock; the caller drops later ones.
+    """
+
+    if not isinstance(record, dict):
+        return None
+    if record.get("type") not in (None, "", "morning_cash"):
+        return None
+    day = _parse_day(record.get("date"))
+    if day is None:
+        return None
+    source = record.get("source")
+    if source in (None, "", "operator"):
+        authority = "operator"
+    elif source == "journal":
+        authority = "journal"
+    else:
+        return None
+    cash_raw = record.get("cash")
+    stop_raw = record.get("daily_stop_usd")
+    has_cash = cash_raw not in (None, "")
+    has_stop = stop_raw not in (None, "")
+    if not has_cash and not has_stop:
+        return None
+    if has_cash:
+        cash = _finite_money(cash_raw)
+        if cash is None:
+            return None
+        stop = daily_stop_from_cash(cash)
+    else:
+        cash = None
+        stop = _finite_money(stop_raw)
+        if stop is None:
+            return None
+    return MorningLock(day=day, cash=cash, stop=stop, authority=authority, dirty=False)
+
+
 @dataclass
 class RiskState:
     cash: Decimal = BANKROLL_USD
@@ -119,6 +207,12 @@ class RiskState:
     fills_today: int = 0
     notional_today: Decimal = Decimal("0")
     fees_today: Decimal = Decimal("0")
+    morning_cash: Decimal | None = None
+    daily_stop: Decimal = field(default_factory=lambda: daily_stop_from_cash(BANKROLL_USD))
+    locks: dict[str, MorningLock] = field(default_factory=dict)
+    _morning_provisional: bool = field(default=False, repr=False, compare=False)
+    _verified_observation: bool = field(default=False, repr=False, compare=False)
+    _replay_today: str | None = field(default=None, repr=False, compare=False)
 
     def summary(self, reason: str) -> dict[str, str | int]:
         return {
@@ -133,11 +227,23 @@ class RiskState:
             "halt_reason": self.halt_reason or "",
         }
 
-    def ensure_day(self, now: datetime) -> dict[str, str | int] | None:
-        """Roll the UTC trading day. Return the closed day's summary."""
+    def install_lock(self, lock: MorningLock) -> None:
+        """Keep the first lock for a UTC day. Later records do not replace it."""
+
+        if lock.day in self.locks:
+            return
+        self.locks[lock.day] = lock
+
+    def ensure_day(self, now: datetime, *, replay_boundary: bool = False) -> dict[str, str | int] | None:
+        """Roll the UTC trading day. Return the closed day's summary.
+
+        Entering a day locks the stop from morning cash. A later call on
+        the same day does not recompute it when cash has moved.
+        """
 
         key = trading_day(now)
         summary = None
+        entering = self.day == "" or key != self.day
         if self.day == "":
             self.day = key
         elif key != self.day:
@@ -149,10 +255,18 @@ class RiskState:
             self.fills_today = 0
             self.notional_today = Decimal("0")
             self.fees_today = Decimal("0")
+        if entering:
+            created = self._lock_day(key, adopt_explicit_cash=replay_boundary)
+            self._set_provisional(created, replay_boundary=replay_boundary)
         self._halt_if_stopped()
         return summary
 
-    def replay(self, records: list[dict], now: datetime) -> None:
+    def replay(
+        self,
+        records: list[dict],
+        now: datetime,
+        heartbeats: list[dict] | None = None,
+    ) -> None:
         """Restore the book from fills.jsonl using the daily-stop day roll.
 
         Every fill and settlement is applied in order, starting from the
@@ -161,8 +275,16 @@ class RiskState:
         counters. It does not reset cash or positions, so a restart after
         the roll starts from the previous day's ending cash and does not
         put that day's realized P&L into the new stop.
+
+        Heartbeats are verified cash and realized P&L. When the fill log
+        does not meet a heartbeat, that stretch is missing and is not
+        booked as zero cash or zero P&L: the heartbeat replaces the
+        inferred figures. The stop still locks once, from the morning
+        figure, and does not follow later cash.
         """
 
+        moment = _as_utc(now)
+        preserved = {day: lock for day, lock in self.locks.items() if not lock.dirty}
         self.cash = BANKROLL_USD
         self.realized = Decimal("0")
         self.halted = False
@@ -172,25 +294,66 @@ class RiskState:
         self.notional_today = Decimal("0")
         self.fees_today = Decimal("0")
         self.day = ""
-        moment = _as_utc(now)
-        for record in records:
-            if not isinstance(record, dict):
-                continue
-            if str(record.get("mode") or "paper") != "paper":
-                continue
-            timestamp = _parse_time(record.get("ts"))
-            if timestamp is None or timestamp > moment:
-                continue
-            self.ensure_day(timestamp)
-            kind = record.get("type")
-            try:
-                if kind == "fill":
-                    self._replay_fill(record)
-                elif kind == "settlement":
-                    self._replay_settlement(record)
-            except (KeyError, ValueError):
-                continue
-        self.ensure_day(now)
+        self.morning_cash = None
+        self.daily_stop = daily_stop_from_cash(BANKROLL_USD)
+        self.locks = preserved
+        self._morning_provisional = False
+        self._verified_observation = False
+        self._replay_today = trading_day(moment)
+        try:
+            grouped: dict[datetime, dict[str, list[dict]]] = {}
+            order: list[datetime] = []
+
+            def add(timestamp: datetime | None, kind: str, record: dict) -> None:
+                if timestamp is None or timestamp > moment:
+                    return
+                bucket = grouped.get(timestamp)
+                if bucket is None:
+                    bucket = {"book": [], "heartbeat": []}
+                    grouped[timestamp] = bucket
+                    order.append(timestamp)
+                bucket[kind].append(record)
+
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                if str(record.get("mode") or "paper") != "paper":
+                    continue
+                add(_parse_time(record.get("ts")), "book", record)
+            for record in heartbeats or []:
+                if not isinstance(record, dict):
+                    continue
+                if str(record.get("mode") or "paper") != "paper":
+                    continue
+                add(_parse_time(record.get("ts")), "heartbeat", record)
+            for timestamp in sorted(order):
+                bucket = grouped[timestamp]
+                self.ensure_day(timestamp, replay_boundary=True)
+                cash_before = quantize_money(self.cash)
+                realized_before = quantize_money(self.realized)
+                for record in bucket["book"]:
+                    kind = record.get("type")
+                    try:
+                        if kind == "fill":
+                            self._replay_fill(record)
+                        elif kind == "settlement":
+                            self._replay_settlement(record)
+                    except (KeyError, ValueError):
+                        continue
+                cash_after = quantize_money(self.cash)
+                realized_after = quantize_money(self.realized)
+                for record in bucket["heartbeat"]:
+                    self._consider_heartbeat(
+                        record,
+                        cash_before,
+                        realized_before,
+                        cash_after,
+                        realized_after,
+                    )
+            self.ensure_day(moment, replay_boundary=True)
+        finally:
+            self._replay_today = None
+            self._morning_provisional = False
 
     def _replay_fill(self, record: dict) -> None:
         window_start = window_start_from_slug(record.get("market"))
@@ -236,8 +399,116 @@ class RiskState:
             self._halt_if_stopped()
             return
 
+    def _lock_day(self, day: str, *, adopt_explicit_cash: bool) -> bool:
+        """Install the day's stop. Return whether this call created it."""
+
+        lock = self.locks.get(day)
+        created = lock is None
+        if lock is None:
+            cash = quantize_money(self.cash)
+            lock = MorningLock(
+                day=day,
+                cash=cash,
+                stop=daily_stop_from_cash(cash),
+                authority="journal",
+                dirty=self._replay_today is None or day == self._replay_today,
+            )
+            self.locks[day] = lock
+        self.morning_cash = lock.cash
+        self.daily_stop = lock.stop
+        if (
+            adopt_explicit_cash
+            and lock.authority == "operator"
+            and lock.cash is not None
+            and quantize_money(self.cash) != lock.cash
+        ):
+            self.cash = lock.cash
+        return created
+
+    def _set_provisional(self, created: bool, *, replay_boundary: bool) -> None:
+        if not replay_boundary or not created:
+            self._morning_provisional = False
+            return
+        self._morning_provisional = not self._verified_observation
+
+    def _heartbeat_observation(self, record: dict) -> tuple[Decimal | None, Decimal | None]:
+        if record.get("type") not in (None, "", "heartbeat"):
+            return None, None
+        cash = _finite_money(record.get("cash"))
+        if cash is None:
+            return None, None
+        raw = record.get("realized_pnl")
+        if raw in (None, ""):
+            return cash, None
+        realized = _finite_money(raw, allow_negative=True)
+        if realized is None:
+            return None, None
+        return cash, realized
+
+    def _consider_heartbeat(
+        self,
+        record: dict,
+        cash_before: Decimal,
+        realized_before: Decimal,
+        cash_after: Decimal,
+        realized_after: Decimal,
+    ) -> None:
+        """Adopt a verified cash reading when the fill log cannot explain it.
+
+        A heartbeat written in the same second as a fill or settlement
+        matches either the cash before those rows or the cash after them.
+        Operator-supplied morning cash is left in place.
+        """
+
+        observed_cash, observed_realized = self._heartbeat_observation(record)
+        if observed_cash is None:
+            return
+        lock = self.locks.get(self.day)
+        if lock is not None and lock.authority == "operator" and lock.cash is not None:
+            self._morning_provisional = False
+            self._verified_observation = True
+            return
+        cash_ok = observed_cash == cash_before or observed_cash == cash_after
+        realized_ok = (
+            observed_realized is None
+            or observed_realized == realized_before
+            or observed_realized == realized_after
+        )
+        if cash_ok and realized_ok:
+            if self._morning_provisional:
+                self._morning_provisional = False
+            self._verified_observation = True
+            return
+        if not cash_ok:
+            self.cash = observed_cash
+        if observed_realized is not None and not realized_ok:
+            self.realized = observed_realized
+        if not cash_ok:
+            self._revise_morning_from_verified_cash()
+        else:
+            self._morning_provisional = False
+        self._verified_observation = True
+        self._halt_if_stopped()
+
+    def _revise_morning_from_verified_cash(self) -> None:
+        """Use the first verified cash when the opening figure was never confirmed."""
+
+        if not self._morning_provisional:
+            return
+        lock = self.locks.get(self.day)
+        if lock is None or lock.authority == "operator":
+            self._morning_provisional = False
+            return
+        cash = quantize_money(self.cash)
+        lock.cash = cash
+        lock.stop = daily_stop_from_cash(cash)
+        lock.dirty = self._replay_today is None or self.day == self._replay_today
+        self.morning_cash = cash
+        self.daily_stop = lock.stop
+        self._morning_provisional = False
+
     def _halt_if_stopped(self) -> None:
-        if self.realized <= -DAILY_STOP_USD:
+        if self.realized <= -self.daily_stop:
             self.halted = True
             self.halt_reason = "daily_stop"
 
@@ -258,7 +529,7 @@ class RiskState:
         )
 
     def daily_room(self) -> Decimal:
-        return DAILY_STOP_USD + self.realized - self.open_worst()
+        return self.daily_stop + self.realized - self.open_worst()
 
     def record(self, window_start: int, approval: Approval) -> Position:
         cost = approval.notional + approval.fee
